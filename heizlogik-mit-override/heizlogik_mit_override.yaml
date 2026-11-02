@@ -1,0 +1,328 @@
+blueprint:
+  name: Heizlogik mit Override
+  author: JimnyCricket
+  description: |
+    ## Heizlogik mit Override
+
+    Manuell freundliche Heizungssteuerung pro Raum.
+
+    Diese Heizlogik setzt auf **Transparenz und Kontrolle**:
+    Automationen unterstützen den Alltag, erzwingen aber kein Verhalten.
+
+    **Logik:**
+    - Globale Heiz-Saison (Pflicht)
+    - Urlaub → ECO
+    - Optionaler Zeitplan → Komfort / ECO
+    - Optionaler Fensterkontakt mit Verzögerung
+    - Ohne Zeitplan bleibt Komfort die Standard-Temperatur
+
+    **Wichtiges Verhalten:**
+    - Die Temperatur wird nur bei Ereignissen gesetzt (Saison, Urlaub,
+      Zeitplan, Fenster, Änderung der Temperatur-Helfer). Manuelle
+      Änderungen am Thermostat bleiben bis zum nächsten Ereignis bestehen.
+    - Änderung von Komfort/ECO wirkt sofort, wenn dieser Modus aktiv ist
+    - Fenster schaltet nach der Verzögerung temporär auf ECO (nicht AUS)
+    - Kurzes Lüften (kürzer als die Verzögerung) wird ignoriert
+
+    ### Voraussetzungen
+    - `input_boolean` für Heiz-Saison
+    - `input_boolean` für Urlaub
+    - `input_number` für Komfort-Temperatur
+    - `input_number` für ECO-Temperatur
+    - `climate` Entität (Thermostat)
+
+    **Optional:**
+    - Fensterkontakt oder Fenster-Gruppe (`binary_sensor`)
+    - Zeitplan (`schedule`)
+
+    ---
+    **Version:** 1.1.0
+    **Von:** JimnyCricket
+
+  domain: automation
+  source_url: https://github.com/xXJimnyCricketXx/ha-blueprints/blob/main/heizlogik-mit-override/heizlogik_mit_override.yaml
+  homeassistant:
+    min_version: 2024.10.0
+
+  input:
+    heiz_saison:
+      name: Heiz-Saison
+      selector:
+        entity:
+          domain: input_boolean
+
+    urlaub:
+      name: Urlaub
+      selector:
+        entity:
+          domain: input_boolean
+
+    climate_entity:
+      name: Thermostat
+      selector:
+        entity:
+          domain: climate
+
+    komfort_temp:
+      name: Komfort-Temperatur
+      selector:
+        entity:
+          domain: input_number
+
+    eco_temp:
+      name: ECO-Temperatur
+      selector:
+        entity:
+          domain: input_number
+
+    zeitplan_aktiv:
+      name: Zeitplan berücksichtigen?
+      default: false
+      selector:
+        boolean: {}
+
+    zeitplan:
+      name: Zeitplan
+      default:
+      selector:
+        entity:
+          domain: schedule
+
+    fenster_aktiv:
+      name: Fenster berücksichtigen?
+      default: false
+      selector:
+        boolean: {}
+
+    fenster:
+      name: Fensterkontakt / Gruppe
+      default:
+      selector:
+        entity:
+          domain: binary_sensor
+
+    fenster_verzoegerung:
+      name: Fenster-Verzögerung
+      description: >
+        So lange muss das Fenster offen sein, bevor auf ECO geschaltet wird.
+        Beim Schließen wird sofort zurückgeschaltet.
+      default: "00:10:00"
+      selector:
+        time:
+
+mode: restart
+
+# -------------------------------------------------
+# Trigger-Variablen
+# (werden vor den Triggern ausgewertet und stehen
+#  dadurch auch in den Template-Triggern zur Verfügung)
+# -------------------------------------------------
+trigger_variables:
+  zeitplan_enabled: !input zeitplan_aktiv
+  zeitplan_ent: !input zeitplan
+  fenster_enabled: !input fenster_aktiv
+  fenster_ent: !input fenster
+
+# -------------------------------------------------
+# Variablen
+# -------------------------------------------------
+variables:
+  urlaub_ent: !input urlaub
+  komfort_ent: !input komfort_temp
+  eco_ent: !input eco_temp
+  fenster_delay: !input fenster_verzoegerung
+  fenster_delay_s: "{{ as_timedelta(fenster_delay).total_seconds() }}"
+
+  # Fenster gilt erst nach Ablauf der Verzögerung als offen (1 s Toleranz)
+  fenster_offen: >
+    {{ (fenster_enabled and fenster_ent and is_state(fenster_ent, 'on')
+        and (now() - states[fenster_ent].last_changed).total_seconds() >= fenster_delay_s - 1)
+       | bool(false) }}
+
+  # Zielmodus: Urlaub, offenes Fenster oder Zeitplan AUS → ECO, sonst Komfort
+  ziel_modus: >
+    {{ 'eco' if is_state(urlaub_ent, 'on') or fenster_offen
+               or (zeitplan_enabled and zeitplan_ent and is_state(zeitplan_ent, 'off'))
+       else 'komfort' }}
+
+  ziel_temp: >
+    {{ states(eco_ent if ziel_modus == 'eco' else komfort_ent) | float(none) }}
+
+# -------------------------------------------------
+# Trigger
+# -------------------------------------------------
+triggers:
+  # Heiz-Saison
+  - trigger: state
+    entity_id: !input heiz_saison
+    from: "off"
+    to: "on"
+    id: season_on
+
+  - trigger: state
+    entity_id: !input heiz_saison
+    from: "on"
+    to: "off"
+    id: season_off
+
+  # Urlaub
+  - trigger: state
+    entity_id: !input urlaub
+    from: "off"
+    to: "on"
+    id: vacation_on
+
+  - trigger: state
+    entity_id: !input urlaub
+    from: "on"
+    to: "off"
+    id: vacation_off
+
+  # Temperatur-Helfer
+  - trigger: state
+    entity_id: !input komfort_temp
+    not_from: ["unavailable", "unknown"]
+    not_to: ["unavailable", "unknown"]
+    id: comfort_temp_changed
+
+  - trigger: state
+    entity_id: !input eco_temp
+    not_from: ["unavailable", "unknown"]
+    not_to: ["unavailable", "unknown"]
+    id: eco_temp_changed
+
+  # Zeitplan (optional, daher als Template-Trigger)
+  - trigger: template
+    value_template: >
+      {{ zeitplan_enabled and zeitplan_ent and is_state(zeitplan_ent, 'on') }}
+    id: schedule_on
+
+  - trigger: template
+    value_template: >
+      {{ zeitplan_enabled and zeitplan_ent and is_state(zeitplan_ent, 'off') }}
+    id: schedule_off
+
+  # Fenster (optional, daher als Template-Trigger)
+  - trigger: template
+    value_template: >
+      {{ fenster_enabled and fenster_ent and is_state(fenster_ent, 'on') }}
+    for: !input fenster_verzoegerung
+    id: window_open
+
+  - trigger: template
+    value_template: >
+      {{ fenster_enabled and fenster_ent and is_state(fenster_ent, 'off') }}
+    id: window_close
+
+# -------------------------------------------------
+# Bedingungen
+# -------------------------------------------------
+conditions:
+  # Template-Trigger beim Start von HA (unavailable → on/off) ignorieren
+  - condition: template
+    value_template: >
+      {{ trigger.platform != 'template'
+         or (trigger.from_state is not none
+             and trigger.from_state.state not in ['unavailable', 'unknown']) }}
+
+# -------------------------------------------------
+# Aktionen
+# -------------------------------------------------
+actions:
+  - choose:
+
+      # -------------------------------------------
+      # Heiz-Saison AUS → Heizung aus
+      # -------------------------------------------
+      - conditions:
+          - condition: trigger
+            id: season_off
+        sequence:
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: !input climate_entity
+            data:
+              hvac_mode: "off"
+
+      # -------------------------------------------
+      # Ab hier nur bei aktiver Heiz-Saison
+      # und gültiger Zieltemperatur
+      # -------------------------------------------
+      - conditions:
+          - condition: state
+            entity_id: !input heiz_saison
+            state: "on"
+          - condition: template
+            value_template: "{{ ziel_temp is number }}"
+        sequence:
+          - choose:
+
+              # -----------------------------------
+              # Heiz-Saison AN → Heizung bereit + Zieltemp
+              # -----------------------------------
+              - conditions:
+                  - condition: trigger
+                    id: season_on
+                sequence:
+                  - action: climate.set_hvac_mode
+                    target:
+                      entity_id: !input climate_entity
+                    data:
+                      hvac_mode: heat
+                  - action: climate.set_temperature
+                    target:
+                      entity_id: !input climate_entity
+                    data:
+                      temperature: "{{ ziel_temp }}"
+
+              # -----------------------------------
+              # Komfort/ECO geändert → nur anwenden,
+              # wenn dieser Modus gerade aktiv ist
+              # -----------------------------------
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ (trigger.id == 'comfort_temp_changed' and ziel_modus == 'komfort')
+                         or (trigger.id == 'eco_temp_changed' and ziel_modus == 'eco') }}
+                sequence:
+                  - action: climate.set_temperature
+                    target:
+                      entity_id: !input climate_entity
+                    data:
+                      temperature: "{{ ziel_temp }}"
+
+              # -----------------------------------
+              # Fenster geschlossen → nur zurückschalten,
+              # wenn es länger als die Verzögerung offen war
+              # -----------------------------------
+              - conditions:
+                  - condition: trigger
+                    id: window_close
+                  - condition: template
+                    value_template: >
+                      {{ (trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds()
+                         >= fenster_delay_s - 1 }}
+                sequence:
+                  - action: climate.set_temperature
+                    target:
+                      entity_id: !input climate_entity
+                    data:
+                      temperature: "{{ ziel_temp }}"
+
+              # -----------------------------------
+              # Urlaub, Zeitplan, Fenster offen → Zieltemp
+              # -----------------------------------
+              - conditions:
+                  - condition: trigger
+                    id:
+                      - vacation_on
+                      - vacation_off
+                      - schedule_on
+                      - schedule_off
+                      - window_open
+                sequence:
+                  - action: climate.set_temperature
+                    target:
+                      entity_id: !input climate_entity
+                    data:
+                      temperature: "{{ ziel_temp }}"
